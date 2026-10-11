@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+subrecon -- subdomain recon + fingerprinting.
+
+pip install requests dnspython
+"""
+
 import argparse
 import json
 import os
@@ -58,6 +65,9 @@ def shell(cmd, timeout=300):
     except Exception:
         return ""
 
+
+# -- crt.sh ----------------------------------------------------------------
+
 def from_crtsh(domain):
     log("crt.sh ...")
     found = set()
@@ -74,6 +84,9 @@ def from_crtsh(domain):
         warn("crt.sh no respondio")
     print(f"    {len(found)}")
     return found
+
+
+# -- herramientas externas (pasivas) ----------------------------------------
 
 def from_subfinder(domain):
     if not has("subfinder"):
@@ -109,14 +122,16 @@ def from_assetfinder(domain):
     return s
 
 
+# -- brute DNS --------------------------------------------------------------
+
 def brute_dns(domain, wordlist, threads):
     found = set()
 
     if has("gobuster") and os.path.isfile(wordlist):
         log(f"gobuster ({os.path.basename(wordlist)}) ...")
         out = shell([
-            "gobuster", "dns", "-d", domain,
-            "-w", wordlist, "-t", str(threads), "--no-color"
+            "gobuster", "dns", "--domain", domain,
+            "-w", wordlist, "-t", str(threads), "--wildcard", "--no-color"
         ], timeout=600)
         for l in out.splitlines():
             l = l.replace("Found: ", "").strip().lower()
@@ -125,6 +140,7 @@ def brute_dns(domain, wordlist, threads):
         print(f"    {len(found)}")
         return found
 
+    # sin gobuster: dnspython
     if dns is None or not os.path.isfile(wordlist):
         warn("ni gobuster ni dnspython para brute -- skip")
         return found
@@ -152,6 +168,8 @@ def brute_dns(domain, wordlist, threads):
     print(f"    {len(found)}")
     return found
 
+
+# -- alive check -------------------------------------------------------------
 
 def alive_check(subs, threads):
     urls = []
@@ -191,6 +209,8 @@ def alive_check(subs, threads):
     print(f"    {len(urls)} vivos")
     return urls
 
+
+# -- cabeceras ---------------------------------------------------------------
 
 SEC_HDRS = [
     ("strict-transport-security", "HSTS"),
@@ -258,6 +278,9 @@ def headers_phase(alive, outdir, threads):
     return out_path
 
 
+# -- tech detection ----------------------------------------------------------
+
+# firmas basicas en html
 SIGS = {
     "wp-content": "WordPress", "wp-includes": "WordPress",
     "joomla": "Joomla", "drupal": "Drupal", "shopify": "Shopify",
@@ -296,6 +319,8 @@ def tech_phase(alive, outdir, threads):
         return ""
 
     out_path = os.path.join(outdir, "tech.txt")
+
+    # whatweb si esta
     if has("whatweb"):
         log(f"whatweb ({len(alive)} urls) ...")
         inp = os.path.join(outdir, "_ww.tmp")
@@ -317,7 +342,8 @@ def tech_phase(alive, outdir, threads):
                     print(f"    {l.rstrip()}")
             return out_path
 
-        log(f"fingerprint ({len(alive)} urls) ...")
+    # fallback propio
+    log(f"fingerprint ({len(alive)} urls) ...")
     results = []
     with ThreadPoolExecutor(max_workers=threads) as pool:
         futs = {pool.submit(fingerprint, u): u for u in alive}
@@ -340,8 +366,8 @@ def tech_phase(alive, outdir, threads):
     return out_path
 
 
+# -- nmap --------------------------------------------------------------------
 
-#NMAP
 def nmap_phase(alive, outdir, threads):
     if not has("nmap"):
         warn("nmap no instalado")
@@ -392,7 +418,7 @@ def nmap_phase(alive, outdir, threads):
     return nmap_txt
 
 
-#SALIDA
+# -- report ------------------------------------------------------------------
 
 def write_report(domain, outdir, total, alive, hdr_f, tech_f, nmap_f, do_ports):
     rpt = os.path.join(outdir, "report.txt")
@@ -428,7 +454,7 @@ def write_report(domain, outdir, total, alive, hdr_f, tech_f, nmap_f, do_ports):
     return rpt
 
 
-###################
+# -- main --------------------------------------------------------------------
 
 def main():
     ap = argparse.ArgumentParser(description="subdomain recon")
