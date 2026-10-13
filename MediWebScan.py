@@ -874,12 +874,57 @@ def _pick_wordlist(user_wl):
     return None
 
 
-def _gobuster_dir(url, wordlist, extensions, threads, timeout=600):
+def _gobuster_dir(url, wordlist, extensions, threads, depth=2, timeout=600):
+    all_results = []
+    to_scan = [url.rstrip("/")]
+    scanned = set()
+
+    for d in range(depth):
+        if not to_scan:
+            break
+        next_scan = []
+        for target in to_scan:
+            if target in scanned:
+                continue
+            scanned.add(target)
+
+            cmd = [
+                "gobuster", "dir", "-u", target, "-w", wordlist,
+                "-t", str(threads), "--no-color", "-q",
+                "-s", "200,204,301,302,307,308,401,403,405,500",
+                "--timeout", "10s", "-k", "-e",
+            ]
+            if extensions:
+                cmd += ["-x", extensions]
+            raw = shell(cmd, timeout=timeout)
+
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line or line.startswith("Error") or line.startswith("Progress"):
+                    continue
+                all_results.append(line)
+                if d < depth - 1:
+                    m = re.match(r'(\S+)\s+\(Status:\s*(\d+)\)', line)
+                    if m:
+                        found_url, status = m.group(1), int(m.group(2))
+                        if status in (301, 302, 403):
+                            path = urlparse(found_url).path
+                            if not os.path.splitext(path)[1]:
+                                next_scan.append(found_url.rstrip("/"))
+
+        to_scan = [u for u in next_scan if u not in scanned]
+        if to_scan:
+            print(f"    {C}↳ recursion depth {d+2}: {len(to_scan)} dirs{Z}")
+
+    return "\n".join(all_results)
+
+
+def _feroxbuster_dir(url, wordlist, extensions, threads, depth=2, timeout=600):
     cmd = [
-        "gobuster", "dir", "-u", url, "-w", wordlist,
-        "-t", str(threads), "--no-color", "-q",
+        "feroxbuster", "-u", url, "-w", wordlist,
+        "-t", str(threads), "-k", "-q", "--no-state", "--auto-tune",
         "-s", "200,204,301,302,307,308,401,403,405,500",
-        "--timeout", "10s", "-k", "-e",
+        "--depth", str(depth),
     ]
     if extensions:
         cmd += ["-x", extensions]
@@ -887,7 +932,7 @@ def _gobuster_dir(url, wordlist, extensions, threads, timeout=600):
 
 
 def _dirb_scan(url, wordlist, extensions, timeout=600):
-    cmd = ["dirb", url, wordlist, "-S", "-r", "-z", "50"]
+    cmd = ["dirb", url, wordlist, "-S", "-z", "50"]
     if extensions:
         ext_list = extensions.split(",")
         cmd += ["-X", "." + ",.".join(ext_list)]
@@ -900,39 +945,57 @@ def _dirb_scan(url, wordlist, extensions, timeout=600):
     return "\n".join(results)
 
 
-def _python_dir_brute(url, wordlist, extensions, threads):
-    words = Path(wordlist).read_text().splitlines()
-    paths = []
-    for w in words:
-        w = w.strip()
-        if not w or w.startswith("#"):
-            continue
-        paths.append(f"/{w}")
-        if extensions:
-            for ext in extensions.split(","):
-                paths.append(f"/{w}.{ext}")
+def _python_dir_brute(url, wordlist, extensions, threads, depth=2):
+    words = [w.strip() for w in Path(wordlist).read_text().splitlines()
+             if w.strip() and not w.strip().startswith("#")]
 
-    results = []
+    all_results = []
+    to_scan = [url.rstrip("/")]
+    scanned = set()
 
-    def probe(path):
-        full = url.rstrip("/") + path
-        try:
-            r = sget(full, timeout=8, allow_redirects=False)
-            if r.status_code in (200, 204, 301, 302, 307, 308, 401, 403, 405, 500):
-                return f"{full} (Status: {r.status_code}) [Size: {len(r.content)}]"
-        except Exception:
-            pass
-        return None
+    for d in range(depth):
+        if not to_scan:
+            break
+        next_scan = []
+        for target in to_scan:
+            if target in scanned:
+                continue
+            scanned.add(target)
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        for r in pool.map(probe, paths):
-            if r:
-                results.append(r)
+            paths = []
+            for w in words:
+                paths.append(f"/{w}")
+                if extensions:
+                    for ext in extensions.split(","):
+                        paths.append(f"/{w}.{ext}")
 
-    return "\n".join(results)
+            def probe(path, _t=target):
+                full = _t + path
+                try:
+                    r = sget(full, timeout=8, allow_redirects=False)
+                    if r.status_code in (200, 204, 301, 302, 307, 308, 401, 403, 405, 500):
+                        return (full, r.status_code, len(r.content))
+                except Exception:
+                    pass
+                return None
+
+            with ThreadPoolExecutor(max_workers=threads) as pool:
+                for r in pool.map(probe, paths):
+                    if r:
+                        found_url, status, size = r
+                        all_results.append(f"{found_url} (Status: {status}) [Size: {size}]")
+                        if d < depth - 1 and status in (301, 302, 403):
+                            if not os.path.splitext(urlparse(found_url).path)[1]:
+                                next_scan.append(found_url.rstrip("/"))
+
+        to_scan = [u for u in next_scan if u not in scanned]
+        if to_scan:
+            print(f"    {C}↳ recursion depth {d+2}: {len(to_scan)} dirs{Z}")
+
+    return "\n".join(all_results)
 
 
-def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=None):
+def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=None, depth=2):
     if not alive:
         warn("no hay urls vivas")
         return ""
@@ -947,16 +1010,19 @@ def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=N
         warn("no se encontro ninguna wordlist de directorios")
         return ""
 
+    use_feroxbuster = has("feroxbuster")
     use_gobuster = has("gobuster")
     use_dirb = has("dirb")
 
-    if not use_gobuster and not use_dirb:
-        warn("ni gobuster ni dirb -- fallback con requests (lento)")
-        tool_name = "python-requests"
+    if use_feroxbuster:
+        tool_name = "feroxbuster"
     elif use_gobuster:
         tool_name = "gobuster"
-    else:
+    elif use_dirb:
         tool_name = "dirb"
+    else:
+        warn("ni feroxbuster, ni gobuster, ni dirb -- fallback con requests (lento)")
+        tool_name = "python-requests"
 
     out_path = os.path.join(outdir, "dirs.txt")
     dirs_dir = os.path.join(outdir, "dirs_per_host")
@@ -965,6 +1031,7 @@ def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=N
     wl_lines = sum(1 for _ in open(wordlist))
     log(f"Dir brute con {tool_name} sobre {len(alive)} hosts")
     log(f"Wordlist: {os.path.basename(wordlist)} ({wl_lines} palabras)")
+    log(f"Profundidad de recursion: {depth}")
     log(f"Extensiones adaptadas a la tecnologia de cada host")
     print()
 
@@ -982,12 +1049,14 @@ def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=N
         print(f"  {C}[{i}/{len(alive)}]{Z} {B}{url}{Z}{waf_note}")
         print(f"         ext: {D}{extensions}{Z}")
 
-        if use_gobuster:
-            raw = _gobuster_dir(url, wordlist, extensions, threads)
+        if use_feroxbuster:
+            raw = _feroxbuster_dir(url, wordlist, extensions, threads, depth)
+        elif use_gobuster:
+            raw = _gobuster_dir(url, wordlist, extensions, threads, depth)
         elif use_dirb:
             raw = _dirb_scan(url, wordlist, extensions)
         else:
-            raw = _python_dir_brute(url, wordlist, extensions, threads)
+            raw = _python_dir_brute(url, wordlist, extensions, threads, depth)
 
         lines = []
         for l in raw.splitlines():
@@ -1610,6 +1679,7 @@ ejemplos:
   %(prog)s example.com                     solo subdominios + fingerprint
   %(prog)s example.com -A                  TODO activado
   %(prog)s example.com -D -C -P            dirs + crawl + params
+  %(prog)s example.com -D --depth 3        dirs con recursion profunda
   %(prog)s example.com -A --stealth        todo con modo sigiloso
   %(prog)s example.com -p -v -D -N -S      puertos + vulns + dirs + nuclei + screenshots
         """)
@@ -1634,6 +1704,8 @@ ejemplos:
     ap.add_argument("--dir-wordlist",
                     default="/usr/share/seclists/Discovery/Web-Content/common.txt",
                     help="wordlist para dir brute")
+    ap.add_argument("--depth", type=int, default=2,
+                    help="profundidad de recursion para dir brute (default: 2)")
     ap.add_argument("-t", "--threads", type=int, default=30)
     ap.add_argument("--no-color", action="store_true")
 
@@ -1751,7 +1823,7 @@ ejemplos:
     if args.dirs:
         banner("FASE 10 — Fuerza bruta de directorios")
         dirs_f = dir_brute(alive, outdir, args.dir_wordlist, args.threads,
-                           tech_cache, waf_cache)
+                           tech_cache, waf_cache, depth=args.depth)
     else:
         banner("FASE 10 — Directorios (saltado, usa -D)")
 
@@ -1816,7 +1888,7 @@ ejemplos:
     ├── report.html    ← {B}abrir en navegador{Z}
     ├── subs_all.txt
     ├── subs_alive.txt""")
-MediWebS
+
     if waf_f:
         print(f"    ├── waf.txt")
     if hdr_f:
