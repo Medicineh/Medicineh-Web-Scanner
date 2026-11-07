@@ -18,6 +18,8 @@ pip install requests dnspython
 import argparse
 import html as html_mod
 import json
+import logging
+import math
 import os
 import random
 import re
@@ -130,14 +132,56 @@ def shead(url, **kwargs):
 
 
 def shell(cmd, timeout=300, stdin_data=None):
+    logging.debug("Ejecutando: %r (timeout=%s)", cmd, timeout)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",
                            timeout=timeout, input=stdin_data)
+        if r.returncode:
+            warn(f"{cmd[0]} terminó con código {r.returncode}: "
+                 f"{(r.stderr or r.stdout).strip()[:1500]}")
+        elif r.stderr:
+            logging.debug("%s stderr: %s", cmd[0], r.stderr.strip())
         return r.stdout
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired as exc:
+        warn(f"{cmd[0]} superó {timeout}s; resultados parciales")
+        output = exc.stdout or ""
+        return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else output
+    except OSError as exc:
+        warn(f"No se pudo ejecutar {cmd[0]}: {exc}")
         return ""
-    except Exception:
-        return ""
+
+
+def normalize_domain(value):
+    """Accept a DNS name or HTTP(S) URL, never paths or CLI options."""
+    value = value.strip()
+    try:
+        parsed = urlparse(value if "://" in value else "//" + value)
+        if parsed.scheme and parsed.scheme not in ("http", "https"):
+            raise ValueError("usa un dominio o una URL HTTP/HTTPS")
+        if parsed.username or parsed.password or parsed.port is not None:
+            raise ValueError("indica el dominio sin credenciales ni puerto")
+        host = (parsed.hostname or "").rstrip(".").encode("idna").decode("ascii").lower()
+        labels = host.split(".")
+        if len(host) > 253 or len(labels) < 2 or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+            for label in labels
+        ):
+            raise ValueError("dominio DNS no válido")
+        return host
+    except (ValueError, UnicodeError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def url_in_scope(url, domains):
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        return parsed.scheme in ("http", "https") and any(
+            host == domain or host.endswith("." + domain) for domain in domains
+        )
+    except ValueError:
+        return False
 
 
 # ── crt.sh ──────────────────────────────────────────────────────────────────
@@ -247,7 +291,7 @@ def brute_dns(domain, wordlist, threads):
 def alive_check(subs, threads):
     urls = []
 
-    if has("httpx"):
+    if has("httpx") and "-silent" in shell(["httpx", "-h"], timeout=10):
         log("httpx -- comprobando respuestas HTTP/HTTPS")
         inp = "\n".join(subs)
         try:
@@ -256,7 +300,10 @@ def alive_check(subs, threads):
                  "-t", str(threads)],
                 input=inp, capture_output=True, text=True, timeout=300
             )
-            urls = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+            urls = [l.strip() for l in r.stdout.splitlines()
+                    if url_in_scope(l.strip(), subs)]
+            if r.returncode:
+                warn(f"httpx falló: {r.stderr.strip()[:1000]}")
         except Exception:
             pass
 
@@ -776,10 +823,9 @@ def takeover_phase(subs, alive, outdir, threads):
                                         result["evidence"] = fingerprint_text
                                         return result
                             except Exception:
-                                # conexion rechazada = podria ser vulnerable
-                                result["evidence"] = "connection refused"
-                                result["vulnerable"] = True
-                                return result
+                                # Network failures do not prove a takeover.
+                                result["evidence"] = "no se pudo comprobar la respuesta HTTP"
+                                continue
                         # CNAME coincide pero no hay fingerprint → sospechoso
                         result["evidence"] = f"CNAME → {cname}"
                         return result
@@ -798,9 +844,9 @@ def takeover_phase(subs, alive, outdir, threads):
 
     with open(out_path, "w") as fp:
         if vulns:
-            fp.write("== VULNERABLES ==\n")
+            fp.write("== POSIBLES TAKEOVERS (requieren validación) ==\n")
             for f in vulns:
-                line = f"[VULN] {f['sub']} → CNAME: {', '.join(f['cnames'])} | servicio: {f['service']} | evidencia: {f['evidence']}"
+                line = f"[CANDIDATO] {f['sub']} → CNAME: {', '.join(f['cnames'])} | servicio: {f['service']} | evidencia: {f['evidence']}"
                 fp.write(line + "\n")
                 print(f"    {R}{line}{Z}")
 
@@ -812,10 +858,10 @@ def takeover_phase(subs, alive, outdir, threads):
                 print(f"    {Y}{line}{Z}")
 
         if not vulns and not suspects:
-            fp.write("(ningún subdominio vulnerable a takeover)\n")
-            print(f"    {G}ningun subdominio vulnerable a takeover{Z}")
+            fp.write("(sin indicios de takeover detectados)\n")
+            print(f"    {G}sin indicios de takeover detectados{Z}")
 
-    log(f"Takeover: {len(vulns)} vulnerables, {len(suspects)} sospechosos")
+    log(f"Takeover: {len(vulns)} candidatos, {len(suspects)} sospechosos")
     return out_path
 
 
@@ -892,6 +938,7 @@ def _gobuster_dir(url, wordlist, extensions, threads, depth=2, timeout=600):
                 "gobuster", "dir", "-u", target, "-w", wordlist,
                 "-t", str(threads), "--no-color", "-q",
                 "-s", "200,204,301,302,307,308,401,403,405,500",
+                "-b", "",
                 "--timeout", "10s", "-k", "-e",
             ]
             if extensions:
@@ -1105,7 +1152,7 @@ def dir_brute(alive, outdir, dir_wordlist, threads, tech_cache=None, waf_cache=N
 
 # ── crawl + JS endpoints ───────────────────────────────────────────────────
 
-def crawl_phase(alive, outdir, threads):
+def crawl_phase(alive, outdir, threads, domain=None):
     if not alive:
         return ""
 
@@ -1139,17 +1186,17 @@ def crawl_phase(alive, outdir, threads):
             for m in re.finditer(r'(?:href|src|action)\s*=\s*["\']([^"\'#]+)', body, re.I):
                 link = m.group(1)
                 if link.startswith("//"):
-                    link = "https:" + link
+                    link = urljoin(r.url, link)
                 elif link.startswith("/"):
-                    link = urljoin(url, link)
+                    link = urljoin(r.url, link)
                 elif not link.startswith("http"):
-                    link = urljoin(url, link)
+                    link = urljoin(r.url, link)
                 found.add(link)
             # extraer endpoints de JS
             for m in re.finditer(r'["\'](/[a-zA-Z0-9._\-/]{2,80})["\']', body):
                 path = m.group(1)
                 if not any(path.endswith(ext) for ext in (".css", ".png", ".jpg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf")):
-                    found.add(urljoin(url, path))
+                    found.add(urljoin(r.url, path))
             # API endpoints en JS
             for m in re.finditer(r'["\'](?:https?://[^"\']+/api/[^"\']*)["\']', body):
                 found.add(m.group(0).strip("\"'"))
@@ -1162,27 +1209,11 @@ def crawl_phase(alive, outdir, threads):
         for f in as_completed(futs):
             all_urls |= f.result()
 
-    # filtrar solo URLs del dominio objetivo
-    domain_hosts = set()
-    for u in alive:
-        p = urlparse(u)
-        if p.hostname:
-            parts = p.hostname.split(".")
-            if len(parts) >= 2:
-                domain_hosts.add(".".join(parts[-2:]))
-
-    filtered = set()
-    for u in all_urls:
-        try:
-            p = urlparse(u)
-            if p.hostname:
-                host_parts = p.hostname.split(".")
-                if len(host_parts) >= 2:
-                    base = ".".join(host_parts[-2:])
-                    if base in domain_hosts:
-                        filtered.add(u)
-        except Exception:
-            pass
+    # Use the actual target, not the last two labels (e.g. co.uk).
+    domain_hosts = {domain} if domain else {
+        urlparse(u).hostname for u in alive if urlparse(u).hostname
+    }
+    filtered = {u for u in all_urls if url_in_scope(u, domain_hosts)}
 
     with open(out_path, "w") as fp:
         for u in sorted(filtered):
@@ -1245,12 +1276,14 @@ def params_phase(domain, alive, outdir, threads):
                 pass
         print(f"    {len(all_urls)} URLs de Wayback API")
 
+    all_urls = {u for u in all_urls if url_in_scope(u, {domain})}
+
     # extraer parametros unicos
     params_found = {}  # param_name -> set of example URLs
     for u in all_urls:
         try:
             parsed = urlparse(u)
-            qs = parse_qs(parsed.query)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
             for param in qs:
                 if param not in params_found:
                     params_found[param] = set()
@@ -1309,7 +1342,7 @@ def nuclei_phase(alive, outdir, threads):
         return ""
 
     out_path = os.path.join(outdir, "nuclei.txt")
-    out_json = os.path.join(outdir, "nuclei.json")
+    out_json = os.path.join(outdir, "nuclei.jsonl")
     targets = os.path.join(outdir, "_nuclei_targets.tmp")
     Path(targets).write_text("\n".join(alive))
 
@@ -1318,7 +1351,7 @@ def nuclei_phase(alive, outdir, threads):
     warn("puede tardar bastante dependiendo del numero de targets")
 
     shell([
-        "nuclei", "-l", targets, "-o", out_path, "-jsonl", out_json,
+        "nuclei", "-l", targets, "-o", out_path, "-jsonl-export", out_json,
         "-c", str(threads), "-silent",
         "-severity", "info,low,medium,high,critical",
         "-retries", "2",
@@ -1684,7 +1717,7 @@ ejemplos:
   %(prog)s example.com -p -v -D -N -S      puertos + vulns + dirs + nuclei + screenshots
         """)
 
-    ap.add_argument("domain")
+    ap.add_argument("domain", type=normalize_domain)
 
     # modulos
     ap.add_argument("-A", "--all", action="store_true",
@@ -1715,7 +1748,14 @@ ejemplos:
     ap.add_argument("--delay", type=float, default=None,
                     help="delay maximo entre peticiones en segundos (default: 2.0 en stealth)")
 
+    ap.add_argument("--debug", action="store_true", help="mostrar diagnósticos de herramientas externas")
     args = ap.parse_args()
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.WARNING,
+                        format="%(levelname)s: %(message)s")
+    if args.threads < 1 or args.depth < 1:
+        ap.error("--threads y --depth deben ser mayores que cero")
+    if args.delay is not None and (not math.isfinite(args.delay) or args.delay < 0):
+        ap.error("--delay debe ser finito y mayor o igual a cero")
 
     # --all activa todo
     if args.all:
@@ -1735,7 +1775,7 @@ ejemplos:
         log(f"Modo stealth activado: delay {STEALTH['delay_min']:.1f}-{STEALTH['delay_max']:.1f}s + UA aleatorio")
 
     domain = args.domain.lower().strip()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     outdir = f"recon_{domain}_{ts}"
     os.makedirs(outdir)
 
@@ -1759,7 +1799,7 @@ ejemplos:
 
     # ── FASE 1: subdominios pasivos ─────────────────────────────────────────
     banner("FASE 1 — Enumeración pasiva de subdominios")
-    subs = set()
+    subs = {domain}
     subs |= from_crtsh(domain)
     subs |= from_subfinder(domain)
     subs |= from_amass(domain)
@@ -1831,7 +1871,7 @@ ejemplos:
     crawl_f = ""
     if args.crawl:
         banner("FASE 11 — Crawl + JS endpoint discovery")
-        crawl_f = crawl_phase(alive, outdir, args.threads)
+        crawl_f = crawl_phase(alive, outdir, args.threads, domain)
     else:
         banner("FASE 11 — Crawl (saltado, usa -C)")
 
@@ -1908,7 +1948,7 @@ ejemplos:
     if params_f:
         print(f"    ├── params.txt + params_juicy.txt")
     if nuclei_f:
-        print(f"    ├── nuclei.txt / nuclei.json")
+        print(f"    ├── nuclei.txt / nuclei.jsonl")
     if ss_f:
         print(f"    └── screenshots/")
 
