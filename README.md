@@ -1,117 +1,185 @@
-# subrecon
+# MediWebScan
 
-Recon script that chains subdomain enumeration, alive checking, header analysis, tech fingerprinting, port scanning, vuln detection and directory bruteforce into one run. Drops everything into a timestamped folder with a summary report.
+Suite de reconocimiento web escrita en Python por **medicineh**. Combina descubrimiento de subdominios, comprobación HTTP, identificación de tecnologías y módulos opcionales, con informes TXT, JSON y HTML.
 
-## Install
+Este README describe la versión corregida de `MediWebScan.py`, incluida su opción `--debug`.
 
-```bash
-# deps
-pip install requests dnspython
+## Instalación
 
-# external tools (optional, the script uses what it finds)
-sudo pacman -S seclists nmap gobuster   # arch/cachyos
-# or
-sudo apt install seclists nmap gobuster # debian/ubuntu
-
-# optional but recommended
-# subfinder  -> go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
-# amass      -> go install github.com/owasp-amass/amass/v4/...@master
-# assetfinder -> go install github.com/tomnomnom/assetfinder@latest
-# httpx      -> go install github.com/projectdiscovery/httpx/cmd/httpx@latest
-# whatweb    -> sudo apt install whatweb
-```
-
-## Usage
+Guarda `MediWebScan.py` en una carpeta y ejecuta desde ella:
 
 ```bash
-# basic recon (subdomain enum + alive check + headers + tech)
-python subrecon.py target.com
-
-# with port scanning
-python subrecon.py target.com -p
-
-# with vuln scripts (implies -p)
-python subrecon.py target.com -v
-
-# with directory bruteforce on alive hosts
-python subrecon.py target.com -D
-
-# everything
-python subrecon.py target.com -p -v -D
-
-# custom wordlists and threads
-python subrecon.py target.com -p -v -D \
-  -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-20000.txt \
-  --dir-wordlist /usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt \
-  -t 50
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install requests dnspython
+python MediWebScan.py --help
 ```
 
-## Flags
+`requests` es obligatorio. `dnspython` permite resolver DNS desde Python; algunas funciones pueden utilizar herramientas externas como alternativa. El programa está orientado a entornos Linux.
 
-```
-domain              target domain
--p, --ports         nmap scan (top 1000, version detection)
--v, --vuln          nmap --script vuln (forces -p if not set)
--D, --dirs          gobuster dir on every alive url
--w, --wordlist      dns bruteforce wordlist (default: seclists top 5000)
---dir-wordlist      directory bruteforce wordlist (default: seclists common.txt)
--t, --threads       parallel threads (default: 30)
---no-color          disable terminal colors
-```
+## Inicio rápido
 
-## What each phase does
+```bash
+# Ejecución básica
+python MediWebScan.py example.com
 
-**Phase 1 -- Passive enum.** Pulls subdomains from public sources without touching the target. Uses crt.sh (certificate transparency logs), subfinder, amass and assetfinder. Each tool queries different APIs (Shodan, VirusTotal, SecurityTrails, Wayback Machine, etc). Skips whatever isn't installed.
+# Diagnósticos de herramientas externas
+python MediWebScan.py example.com --debug
 
-**Phase 2 -- DNS bruteforce.** Takes a wordlist, prepends each word to the domain and queries DNS to see if it resolves. Uses gobuster dns mode, falls back to dnspython if gobuster isn't there. Runs with `--wildcard` so it doesn't abort on domains that respond to everything.
+# Directorios, crawling y URLs históricas
+python MediWebScan.py example.com -D -C -P
 
-**Phase 3 -- Alive check.** Sends HTTP/HTTPS requests to every subdomain found to see which ones actually have a web server running. Uses httpx if available, otherwise does it with python requests.
-
-**Phase 4 -- HTTP headers.** Grabs response headers from every alive url. Checks for missing security headers (HSTS, CSP, X-Frame-Options, XCTO, XSS-Protection, Permissions-Policy, Referrer-Policy) and prints a summary table.
-
-**Phase 5 -- Tech fingerprint.** Identifies what's running behind each url: web server, CMS, framework, JS libraries. Uses whatweb if installed, otherwise parses headers and HTML looking for known signatures (WordPress, Django, Next.js, Cloudflare, etc).
-
-**Phase 6 -- Port scan (-p).** Resolves alive hosts to IPs and runs nmap with `-sV -sC` on the top 1000 ports. Outputs both text and XML.
-
-**Phase 7 -- Vuln scan (-v).** Second nmap pass with `--script vuln` against the same IPs. Tests for known CVEs, misconfigurations, XSS, SQLi, etc. Takes a while.
-
-**Phase 8 -- Dir brute (-D).** Runs gobuster in dir mode against every alive url. Tries paths like `/admin`, `/login`, `/api`, `/backup` from the wordlist. Shows the first 20 hits per url on screen, full results go to the output file.
-
-## Output
-
-Everything goes into `recon_<domain>_<timestamp>/`:
-
-```
-subs_all.txt      all unique subdomains found
-subs_alive.txt    subdomains that responded to HTTP
-headers.txt       full headers + security header matrix
-tech.txt          detected technologies per url
-nmap.txt          port scan results (text)
-nmap.xml          port scan results (xml, for tools like searchsploit)
-nmap_vuln.txt     vulnerability scan results
-nmap_vuln.xml     vulnerability scan results (xml)
-dirs.txt          directory bruteforce results per url
-ips.txt           resolved IPs
-report.txt        summary of everything
+# Todos los módulos
+python MediWebScan.py example.com -A
 ```
 
-## Tool priority
+Sustituye `example.com` por el dominio de tu evaluación autorizada.
 
-The script checks what's installed and picks the best available option. Nothing except python + requests is strictly required, but more tools = better coverage.
+También se acepta una URL HTTP/HTTPS. Se extrae su dominio: `https://example.com/ruta` se convierte en `example.com`; la ruta no limita el análisis. No se admiten credenciales ni puertos en el objetivo.
 
-| Phase | Preferred | Fallback |
-|---|---|---|
-| Passive enum | subfinder + amass + assetfinder + crt.sh | crt.sh alone works |
-| DNS brute | gobuster | dnspython |
-| Alive check | httpx | python requests |
-| Tech detect | whatweb | header + HTML parsing |
-| Port/vuln scan | nmap | -- |
-| Dir brute | gobuster | -- |
+La ejecución básica ya realiza solicitudes activas: además de fuentes pasivas, incluye fuerza bruta DNS cuando dispone de diccionario y resolutor, comprobación HTTP, detección WAF/CDN, cabeceras y tecnologías. No es un modo exclusivamente pasivo.
 
-## Heads up
+## Opciones
 
-Only run this against domains you own or have written permission to test. Phases 2+ send real traffic to the target. The passive phase (1) doesn't touch the target at all.
+| Opción | Función |
+| --- | --- |
+| `-h`, `--help` | Mostrar ayuda. |
+| `-A`, `--all` | Activar todos los módulos opcionales. |
+| `-p`, `--ports` | Escaneo de puertos y servicios con Nmap. |
+| `-v`, `--vuln` | Scripts `vuln` de Nmap; prepara el escaneo de puertos si es necesario. |
+| `-D`, `--dirs` | Enumeración de directorios y archivos. |
+| `-C`, `--crawl` | Descubrimiento de enlaces y endpoints. |
+| `-N`, `--nuclei` | Ejecutar Nuclei. |
+| `-S`, `--screenshots` | Capturar páginas con herramientas externas. |
+| `-T`, `--takeover` | Buscar indicios de subdomain takeover. |
+| `-P`, `--params` | Consultar URLs históricas y extraer parámetros. |
+| `-w`, `--wordlist` | Ruta del diccionario DNS. |
+| `--dir-wordlist` | Ruta del diccionario de directorios. |
+| `--depth` | Profundidad de enumeración de directorios; predeterminado: `2`. |
+| `-t`, `--threads` | Concurrencia solicitada; predeterminado: `30`. |
+| `--no-color` | Desactivar colores propios de la consola. |
+| `--stealth` | Activar pausas aleatorias en las solicitudes Python compatibles. |
+| `--delay` | Pausa máxima en segundos; con `--stealth`, predeterminado: `2.0`. |
+| `--debug` | Mostrar comandos externos, tiempos límite y diagnósticos disponibles. |
 
-## License
+`--threads` y `--depth` deben ser mayores que cero. `--delay` debe ser finito y no negativo; solo tiene efecto junto con `--stealth`.
 
-Do whatever you want with it.
+## Diccionarios
+
+Rutas predeterminadas:
+
+```text
+DNS:         /usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt
+Directorios: /usr/share/seclists/Discovery/Web-Content/common.txt
+```
+
+Puedes utilizar tus propios archivos, con una entrada por línea:
+
+```bash
+python MediWebScan.py example.com -D \
+  -w ./dns.txt \
+  --dir-wordlist ./directorios.txt \
+  --depth 2 -t 10
+```
+
+Si no encuentra un diccionario de directorios, busca alternativas de SecLists y dirb en rutas conocidas. Si no encuentra ninguno, omite esa fase. Si no dispone de diccionario DNS o resolutor compatible, omite la fuerza bruta DNS.
+
+## Herramientas opcionales
+
+Instala las que necesites y comprueba que sus ejecutables estén en `PATH`.
+
+| Función | Herramientas o alternativa |
+| --- | --- |
+| Subdominios pasivos | crt.sh mediante Python; `subfinder`, `amass`, `assetfinder` si están disponibles. |
+| Fuerza bruta DNS | `gobuster` o `dnspython`. |
+| Comprobación HTTP | `httpx` de ProjectDiscovery o `requests`. |
+| WAF/CDN | `wafw00f` y comprobación propia. |
+| Tecnologías | `whatweb` y fingerprint propio. |
+| Puertos y vulnerabilidades Nmap | `nmap`. |
+| Resolución CNAME | `dnspython` o `dig`. |
+| Directorios | `feroxbuster`, `gobuster`, `dirb` o Python, en ese orden. |
+| Crawling | `katana` y extracción propia de enlaces. |
+| URLs históricas | `waybackurls`, `gau` o API de Wayback si faltan ambos. |
+| Plantillas de vulnerabilidades | `nuclei`. |
+| Capturas | `gowitness`, `eyewitness`, `cutycapt` o `wkhtmltoimage`. |
+
+Las interfaces de estas herramientas pueden variar según su versión. `httpx` de ProjectDiscovery es distinto del cliente HTTP de Python del mismo nombre. Las opciones de profundidad y concurrencia no se aplican de forma idéntica a todos los motores; por ejemplo, la integración de dirb no recibe `--depth`.
+
+## Resultados
+
+Cada ejecución crea una carpeta en el **directorio de trabajo actual**:
+
+```text
+recon_example.com_FECHA_HORA_MICROSEGUNDOS/
+├── report.txt
+├── report.json
+├── report.html
+├── subs_all.txt
+├── subs_alive.txt
+├── waf.txt
+├── headers.txt
+├── tech.txt
+├── takeover.txt
+├── ips.txt
+├── nmap.txt / nmap.xml
+├── nmap_vuln.txt / nmap_vuln.xml
+├── dirs.txt
+├── dirs_per_host/
+├── crawl.txt
+├── params.txt
+├── params_juicy.txt
+├── nuclei.txt
+├── nuclei.jsonl
+└── screenshots/
+    └── gallery.html
+```
+
+Los archivos de módulos opcionales solo aparecen cuando la fase se ejecuta y produce el archivo correspondiente. La galería depende de la herramienta de capturas utilizada. `params_juicy.txt` solo se genera si encuentra URLs con las extensiones seleccionadas.
+
+Abre `report.html` en el navegador para consultar el informe. `report.json` contiene el resumen y los resultados de las fases como texto; no es un inventario completamente estructurado de hallazgos. La exportación de Nuclei utiliza JSONL, con un objeto JSON por línea.
+
+## Depuración
+
+```bash
+python MediWebScan.py example.com --debug --no-color > debug.log 2>&1
+```
+
+| Síntoma | Comprobación |
+| --- | --- |
+| Mensaje solicitando `requests` | Activa el entorno virtual e instala las dependencias en él. |
+| Una herramienta no se ejecuta | Comprueba su presencia con `command -v nombre` y consulta su ayuda. |
+| Error de argumentos de una herramienta | Revisa `debug.log` y la versión instalada. |
+| No se enumeran directorios | Comprueba el diccionario y los mensajes del motor utilizado. |
+| No aparecen capturas | Comprueba que exista una herramienta compatible y sus requisitos de navegador o entorno gráfico. |
+| Resultados parciales | Algunas herramientas tienen tiempos límite; revisa los avisos de timeout. |
+| No aparecen subdominios adicionales | Las fuentes públicas pueden fallar o no tener datos; el dominio principal se conserva. |
+
+`--debug` facilita el diagnóstico de procesos externos, pero no elimina todos los bloques que capturan excepciones ni garantiza una traza de cada fallo HTTP o DNS.
+
+## Comportamiento y límites
+
+- El modo `--stealth` introduce pausas por solicitud Python, entre el 30 % y el 100 % del máximo configurado. No impone un límite global de peticiones ni controla automáticamente las herramientas externas. El User-Agent ya se elige aleatoriamente en los helpers HTTP habituales.
+- El crawler y la recopilación histórica filtran URLs por el dominio objetivo y sus subdominios. Esto no constituye un control global de alcance: otras fases pueden seguir redirecciones, y Nmap trabaja sobre las IP resueltas, que pueden ser compartidas.
+- Las comprobaciones HTTP propias desactivan la verificación de certificados TLS.
+- Las firmas de tecnologías, WAF y takeover son heurísticas. Un candidato a takeover requiere validación; un error de conexión no demuestra vulnerabilidad.
+- La enumeración Python de directorios no filtra automáticamente todas las páginas de error que responden con código `200`.
+- La ausencia de hallazgos no demuestra que un sitio carezca de vulnerabilidades.
+
+## Cambios de la versión corregida
+
+- Añadida la opción `--debug` y mensajes sobre errores de procesos externos.
+- Conservación de salida parcial cuando un proceso alcanza su tiempo límite.
+- Validación del objetivo, hilos, profundidad y demora.
+- Inclusión del dominio principal aunque las fuentes pasivas no devuelvan resultados.
+- Corrección del argumento de exportación JSONL de Nuclei.
+- Desactivación explícita de la lista negra de estados de Gobuster al utilizar la lista positiva.
+- Filtrado del crawler por dominio completo, evitando mezclar objetivos distintos bajo sufijos como `co.uk`.
+- Resolución de enlaces relativos respecto a la URL final de la respuesta.
+- Filtrado de URLs históricas y conservación de parámetros con valores vacíos.
+- Los errores de conexión ya no se presentan como takeover confirmado.
+
+La versión se verificó con compilación Python, ayuda de consola y ocho pruebas de regresión con respuestas simuladas. No se ha validado una ejecución completa contra un objetivo real ni todas las versiones de herramientas externas.
+
+## Autor
+
+**medicineh** · [Medicineh-Web-Scanner](https://github.com/Medicineh/Medicineh-Web-Scanner)
